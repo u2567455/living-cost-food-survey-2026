@@ -1,0 +1,1261 @@
+---
+title: "LCFS Analysis"
+author: "U2567455"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+  pdf_document:
+    toc: true
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Initial Setup
+
+Please keep this file in the `Assessment` directory alongside
+`data_dict_mod.csv` and the `UKDA-9603-stata` directory. Individual R
+scripts can be also used from repo github/.
+
+The full data set could be downloaded from:
+<https://datacatalogue.ukdataservice.ac.uk/studies/study/9603>
+
+-Please unzip the file and, (optional) the data dictionary folders
+inside
+
+-Please Remember to set the working directory
+
+Alternatively, clone from <https://github.com/u2567455/living-cost-food-survey-2026>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center",
+  dpi = 120
+)
+
+required_packages <- c(
+  "haven", "labelled", "tidyverse", "rpart", "rpart.plot",
+  "randomForest", "gbm", "patchwork", "caret", "knitr", "rmarkdown", "class",
+  "ggplot2", "ggthemes"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the required packages before knitting: install.packages(c(",
+    paste(sprintf('"%s"', missing_packages), collapse = ", "),
+    "))"
+  )
+}
+```
+
+## Libraries and report styles
+
+The shared plotting style and colors are global
+
+```{r message=FALSE}
+library(haven)
+library(labelled)
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+library(patchwork)
+library(caret)
+library(pROC)
+library(class)
+library(ggplot2)
+library(ggthemes)
+```
+
+```{r report-style}
+theme_colors <- c(
+  "#0F172A", "#1E3A5F", "#2E5E7E",
+  "#3B82A8", "#5DADE2", "#A7D3F2"
+)
+
+theme_report <- theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    strip.text = element_text(size = 11),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Data preparation
+
+## Import and initial variable selection
+
+The raw data are read from a Stata file. Expenditure-code and
+questionnaire-filter variables are removed. Please use setwd() as needed
+
+```{r import-data}
+lcfs_2024 <- read_dta("UKDA-9603-stata/stata/stata13_se/dvhh_urban_rural_uk_anon_v2_2024.dta")
+
+cols <- names(lcfs_2024)
+cat("Var count: ",length(cols),"\n")
+
+#Refer docs > UKDA-9603-stata\mrdoc\pdf\9603_volume_g_2024_25.pdf for variable types
+
+a_cols <- cols[startsWith(cols, "a")]
+b_cols <- cols[startsWith(cols, "b")]
+c_cols <- cols[startsWith(cols, "c")]
+p_cols <- cols[startsWith(cols, "p")]
+p_end_cols <- cols[endsWith(cols, "p")]
+
+expenditure_cols <- grep("^c.*[0-9]", cols, value = TRUE)
+important_cols <- setdiff(cols, expenditure_cols)
+
+filter_cols_searchlist <- c(
+  "geteldet", "eteldet", "tvserv", "tvfilt",
+  "geteltv", "eteltv", "telserv", "telsmart", "combfilt"
+)
+pattern <- paste(filter_cols_searchlist, collapse = "|")
+filter_cols <- grep(pattern, cols, value = TRUE)
+important_cols <- setdiff(important_cols, filter_cols)
+
+lcfs_2024_cleaned <- lcfs_2024[, important_cols]
+cat("Var count after cleaning : ",length(names(lcfs_2024_cleaned)),"\n")
+```
+
+## Data dictionary and selected variables
+
+The existing `data_dict_mod.csv` controls which variables enter the
+analysis: rows marked `isUsable = 1` are selected. Lines 123-129 are
+optional
+
+```{r data-dictionary}
+data_dict <- tibble(
+  name = names(lcfs_2024_cleaned),
+  description = unname(var_label(lcfs_2024_cleaned, unlist = TRUE)),
+  isUsable = 0
+)
+
+write.csv(data_dict, file = "data_dict.csv", row.names = FALSE)
+
+#Manually sift the important variables and create a data_dict_mod.csv from data_dict.csv
+#data_dict_mod <- read_csv("data_dict_mod.csv")
+#Selected variables into a variable (Toggle isUsable from .csv to include any var)
+#selected_variables <- data_dict_mod %>% filter(isUsable ==1)
+
+#Or use below list
+study_variables <- c(
+  "a049", "a124", "ctpcnt", "ctproxy", "g018", "g019",
+  "p204", "p535cp", "p535tp", "p535p", "p537", "p538",
+  "p538c", "p539", "p540", "p541", "p541c", "p542",
+  "p542c", "p543", "p543c", "p544", "p544c", "p545",
+  "p545c", "p546", "p546c", "p547", "p547c", "p548",
+  "p548c", "p549", "p549c", "a054", "a056", "a060",
+  "a091", "a093", "a094", "p203", "p304", "p336",
+  "p348", "p153t", "gorx", "p365p", "p344p", "anon_income",
+  "p493p", "a069p", "mcvkid", "oecdvkid", "eqincdo_updated",
+  "eqincgo_updated", "urindew", "urindsc", "a1711p", "a1646p",
+  "a172ap", "a172bp", "a172p", "a172cp", "a112"
+)
+
+#Selected variables
+selected_variables <- data_dict %>%
+  filter(name %in% study_variables)
+
+#Add a clean variable name (remove special chars, space etc)
+selected_variables <- selected_variables %>%
+  dplyr::mutate(
+    clean_description = description %>%
+      str_trim() %>%
+      str_replace_all("[^A-Za-z0-9 ]", "") %>%
+      str_replace_all("\\s+", "_") %>%
+      str_to_lower() %>%
+      paste(name, sep = "_")
+  )
+
+lcfs_data <- lcfs_2024_cleaned[, selected_variables$name]
+names(lcfs_data) <- selected_variables$clean_description
+cat("Var count after selecting : ",length(names(lcfs_data)),"\n")
+```
+
+## Rename variables and handle missing values
+
+Selected labelled variables are converted to factors, and rows
+containing missing values are removed, following the preparation script.
+
+```{r clean-data}
+#Variable renames. Add everything here as needed (for clarity)
+lcfs_data <- lcfs_data %>%
+  dplyr::rename(
+    urban_rural_indicator = urindew_urindew,
+    council_tax = anonymised_council_tax_ctproxy,
+    socio_economic_group = socioeconomic_group_household_reference_person_a091,
+    government_office_region = government_office_region_modified_gorx,
+    economic_position_of_hrp = economic_position_of_household_reference_person_a093,
+    gross_normal_income_of_hrp = gross_normal_income_of_hrp_by_range_a060,
+    class_of_hrp = ns_sec_8_class_of_household_reference_person_a094,
+    household_size = household_size_a049,
+    total_personal_expenditure = total_personal_expenditure_children_and_adults_p153t,
+    food_adults = ons_food_adults_p538
+  )
+
+
+#Convert haven types to R
+lcfs_data <- lcfs_data %>%
+  mutate(across(where(is.labelled), as_factor))
+
+#Remove NA values
+rows_before_missing <- nrow(lcfs_data)
+lcfs_data <- na.omit(lcfs_data)
+
+knitr::kable(
+  data.frame(
+    Measure = c("Imported rows", "Rows removed for missing values",
+                "Analysis rows", "Selected variables"),
+    Count = c(nrow(lcfs_2024), rows_before_missing - nrow(lcfs_data),
+              nrow(lcfs_data), ncol(lcfs_data))
+  ),
+  caption = "Data preparation summary"
+)
+```
+
+# Plot Income
+
+```{r plot-income}
+the_base <- ggplot(lcfs_data, aes(x = anonincome_anon_income))
+the_base
+
+basic_histogram <- the_base +
+  geom_histogram(
+    aes(fill = after_stat(x)),
+    bins = 20,
+    colour = "#0F172A",
+    linewidth = 0.4
+  ) +
+  scale_fill_gradientn(
+    colours = theme_colors,
+    guide = "none"
+  ) +
+  labs(
+    title = "Distribution of Income",
+    x = "Income",
+    y = "Count"
+  ) +
+  theme_report
+basic_histogram
+```
+
+# Training and test data
+
+This is optional. Caret package flags variables with near zero variance
+For example: Motoring expenditure by Kids
+
+```{r remove-zero-var}
+#Remove variables with near Zero Variance
+nzv_cols <- nearZeroVar(lcfs_data, names = TRUE)
+lcfs_data <- lcfs_data %>% select(-all_of(nzv_cols))
+knitr::kable(
+  data.frame(
+    Set = "Near-zero variance variables removed",
+    Count = length(nzv_cols)
+  ),
+  caption = "Near-zero variance variables removed from LCFS data"
+)
+```
+
+A reproducable random split assigns 60% of the cleaned observations to
+training and the remaining 40% to testing. All models use the same rows.
+
+```{r train-test-split}
+set.seed(123)
+n <- nrow(lcfs_data)
+train_idx <- sample(seq_len(n), size = floor(0.6 * n))
+test_idx <- setdiff(seq_len(n), train_idx)
+lcfs_train <- lcfs_data[train_idx, ]
+lcfs_test <- lcfs_data[test_idx, ]
+
+knitr::kable(
+  data.frame(Set = c("Training", "Test"),
+             Observations = c(nrow(lcfs_train), nrow(lcfs_test))),
+  caption = "Shared training/test split"
+)
+```
+
+# Decision tree
+
+## Baseline model and predictions
+
+The baseline regression tree uses a complexity parameter of `cp = 0.1`.
+
+```{r decision-tree-fit}
+tpe_tree <- rpart(
+  total_personal_expenditure ~ ., data = lcfs_train, cp = 0.1
+)
+rpart.plot(
+  tpe_tree,
+  box.palette = "#A7D3F2",
+  shadow.col = "#5DADE2",
+  legend.x = NA
+)
+
+tpe_tree_predictions <- predict(tpe_tree, newdata = lcfs_test)
+tree_mse <- mean(
+  (lcfs_test$total_personal_expenditure - tpe_tree_predictions)^2
+)
+cat("Decision tree test MSE:", round(tree_mse, 3), "\n")
+```
+
+```{r decision-tree-predictions}
+ggplot(
+  data.frame(actual = lcfs_test$total_personal_expenditure,
+             predicted = tpe_tree_predictions),
+  aes(x = actual, y = predicted)
+) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(title = "Decision Tree: Actual vs Predicted Expenditure",
+       x = "Actual Total Personal Expenditure",
+       y = "Predicted Total Personal Expenditure") +
+  coord_fixed() +
+  expand_limits(
+    x = range(lcfs_test$total_personal_expenditure, tpe_tree_predictions),
+    y = range(lcfs_test$total_personal_expenditure, tpe_tree_predictions)
+  ) +
+  theme_report
+```
+
+## Hyperparameter tuning
+
+Finding the best complexity parameter
+
+```{r decision-tree-complexity}
+cp_values <- seq(0, 0.01, length.out = 100)
+results <- data.frame(cp = numeric(), mse_train = numeric(), mse_test = numeric())
+
+for (cp in cp_values) {
+  tree_model <- rpart(
+    total_personal_expenditure ~ ., data = lcfs_train,
+    cp = cp, minsplit = 50, maxdepth = 20
+  )
+  predictions_train <- predict(tree_model, newdata = lcfs_train)
+  predictions_test <- predict(tree_model, newdata = lcfs_test)
+  
+  mse_train <- mean((lcfs_train$total_personal_expenditure - predictions_train)^2)
+  mse_test <- mean((lcfs_test$total_personal_expenditure - predictions_test)^2)
+  
+  results <- rbind(results, data.frame(cp = cp, mse_train = mse_train,
+                                      mse_test = mse_test))
+}
+```
+
+```{r decision-tree-complexity-plot, fig.width=11}
+p_train <- ggplot(results, aes(x = cp, y = mse_train)) +
+  geom_line(color = "#1E3A5F") +
+  labs(title = "Training MSE vs Complexity Parameter",
+       x = "Complexity Parameter (cp)", y = "MSE") +
+  theme_report
+
+p_test <- ggplot(results, aes(x = cp, y = mse_test)) +
+  geom_line(color = "#b50279") +
+  labs(title = "Test MSE vs Complexity Parameter",
+       x = "Complexity Parameter (cp)", y = "MSE") +
+  theme_report
+
+p_train + p_test
+```
+
+# Random forest
+
+## Baseline model
+
+The initial forest uses 50 trees and samples four predictors at each
+split.
+
+```{r random-forest-baseline}
+rf.lcfs <- randomForest(
+  total_personal_expenditure ~ .,
+  data = lcfs_train,
+  ntree = 50,
+  mtry = 4,
+  importance = FALSE,
+  na.action = na.omit
+)
+rf.predictions <- predict(rf.lcfs, newdata = lcfs_test)
+rf.mse <- mean((lcfs_test$total_personal_expenditure - rf.predictions)^2)
+cat("Baseline random forest test MSE:", round(rf.mse, 3), "\n")
+```
+
+```{r random-forest-baseline-plot}
+ggplot(
+  data.frame(actual = lcfs_test$total_personal_expenditure,
+             predicted = rf.predictions),
+  aes(x = actual, y = predicted)
+) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(title = "Random Forest: Total Personal Expenditure Predictions",
+       x = "Actual Total Personal Expenditure",
+       y = "Predicted Total Personal Expenditure") +
+  theme_report +
+  coord_fixed() +
+  expand_limits(
+    x = range(lcfs_test$total_personal_expenditure, rf.predictions),
+    y = range(lcfs_test$total_personal_expenditure, rf.predictions)
+  )
+```
+
+## Hyperparameter tuning
+
+Five-fold cross-validation on the training data compares `mtry` values
+of 3, 5, and 7, and forests with 100, 300, and 500 trees.
+
+```{r random-forest-tuning}
+tune_grid <- data.frame(mtry = c(3, 5, 7))
+ntree_values <- c(100, 300, 500)
+rf_results_all <- data.frame()
+
+set.seed(123)
+rf_folds <- createFolds(
+  lcfs_train$total_personal_expenditure, k = 5, returnTrain = TRUE
+)
+rf_control <- trainControl(method = "cv", number = 5, index = rf_folds)
+best_rmse <- Inf
+best_rf_model <- NULL
+
+for (nt in ntree_values) {
+  rf_model <- train(
+    total_personal_expenditure ~ .,
+    data = lcfs_train,
+    method = "rf",
+    metric = "RMSE",
+    tuneGrid = tune_grid,
+    trControl = rf_control,
+    ntree = nt,
+    importance = FALSE
+  )
+  rf_results_all <- bind_rows(
+    rf_results_all,
+    rf_model$results %>% mutate(ntree = nt)
+  )
+  model_rmse <- min(rf_model$results$RMSE)
+  if (is.finite(model_rmse) && model_rmse < best_rmse) {
+    best_rmse <- model_rmse
+    best_rf_model <- rf_model
+  }
+}
+
+if (is.null(best_rf_model)) {
+  stop("Random forest tuning did not produce a model with finite CV RMSE.")
+}
+knitr::kable(rf_results_all, digits = 3,
+             caption = "Random forest cross-validation results")
+knitr::kable(
+  data.frame(ntree = best_rf_model$finalModel$ntree,
+             mtry = best_rf_model$bestTune$mtry, CV_RMSE = best_rmse),
+  digits = 3, caption = "Selected random forest parameters"
+)
+```
+
+```{r random-forest-tuning-plot}
+ggplot(rf_results_all, aes(x = ntree, y = RMSE, color = factor(mtry))) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Random Forest Parameter Tuning (LCFS Data)",
+       x = "Number of Trees (ntree)",
+       y = "Cross-Validation RMSE", color = "mtry") +
+  theme_report
+```
+
+## Tuned model test performance
+
+```{r random-forest-test}
+rf_predictions <- predict(best_rf_model, newdata = lcfs_test)
+rf_mse <- mean((lcfs_test$total_personal_expenditure - rf_predictions)^2)
+cat("Tuned random forest test MSE:", round(rf_mse, 3), "\n")
+
+ggplot(
+  data.frame(actual = lcfs_test$total_personal_expenditure,
+             predicted = rf_predictions),
+  aes(x = actual, y = predicted)
+) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(title = "Random Forest: Tuned Predictions",
+       x = "Actual Total Personal Expenditure",
+       y = "Predicted Total Personal Expenditure") +
+  theme_report +
+  coord_fixed() +
+  expand_limits(
+    x = range(lcfs_test$total_personal_expenditure, rf_predictions),
+    y = range(lcfs_test$total_personal_expenditure, rf_predictions)
+  )
+```
+
+# Gradient boosting
+
+## Baseline model
+
+The initial Gaussian boosting model uses 500 trees, an interaction depth
+of 3, a learning rate of 0.1, and a minimum of 10 observations per
+terminal node.
+
+```{r gradient-boosting-baseline}
+gb_lcfs <- gbm(
+  total_personal_expenditure ~ .,
+  data = lcfs_train,
+  distribution = "gaussian",
+  n.trees = 500,
+  interaction.depth = 3,
+  shrinkage = 0.1,
+  cv.folds = 0,
+  n.minobsinnode = 10,
+  verbose = FALSE
+)
+gbm_train_pred <- predict(gb_lcfs, newdata = lcfs_train, n.trees = 500)
+gbm_test_pred <- predict(gb_lcfs, newdata = lcfs_test, n.trees = 500)
+
+train_mse <- mean((lcfs_train$total_personal_expenditure - gbm_train_pred)^2)
+test_mse <- mean((lcfs_test$total_personal_expenditure - gbm_test_pred)^2)
+
+knitr::kable(
+  data.frame(Set = c("Training", "Test"), MSE = c(train_mse, test_mse)),
+  digits = 3, caption = "Baseline gradient boosting performance"
+)
+```
+
+## Hyperparameter tuning
+
+Five-fold cross-validation compares interaction depths of 2 through 5
+and learning rates of 0.01 and 0.1, retaining 500 trees and a minimum
+node size of 10.
+
+```{r gradient-boosting-tuning}
+ctrl <- trainControl(method = "cv", number = 5, returnResamp = "all")
+gbm_grid <- expand.grid(
+  n.trees = 500,
+  interaction.depth = c(2, 3, 4, 5),
+  shrinkage = c(0.01, 0.1),
+  n.minobsinnode = 10
+)
+
+set.seed(123)
+gb_lcfs <- suppressWarnings(
+  gbm_model <- train(
+  total_personal_expenditure ~ .,
+  data = lcfs_train,
+  method = "gbm",
+  metric = "RMSE",
+  trControl = ctrl,
+  tuneGrid = gbm_grid,
+  verbose = FALSE
+  )
+)
+print(gbm_model)
+knitr::kable(gbm_model$bestTune, caption = "Selected gradient boosting parameters")
+```
+
+```{r gradient-boosting-tuning-plot}
+ggplot(
+  gbm_model$results,
+  aes(x = interaction.depth, y = RMSE, color = factor(shrinkage))
+) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Gradient Boosting Parameter Tuning (LCFS Data)",
+       x = "Maximum Tree Depth", y = "Cross-Validation RMSE",
+       color = "Learning Rate") +
+  theme_report
+```
+
+## Tuned model test performance
+
+```{r gradient-boosting-test}
+gbm_test_pred_optim <- predict(gbm_model, newdata = lcfs_test)
+test_rmse <- sqrt(mean(
+  (lcfs_test$total_personal_expenditure - gbm_test_pred_optim)^2
+))
+cat("Tuned gradient boosting test RMSE:", round(test_rmse, 3), "\n")
+```
+
+## GBM interpretation
+
+This returns a data frame ranked by rel.inf (relative influence, summing
+to 100%)
+
+```{r gmb-interpretation}
+invisible(summary(gb_lcfs, plotit = TRUE)) #To prevent knitted doc from bloating, use invisible
+
+#Or caret
+var_imp <- varImp(gbm_model)
+plot(var_imp, top = 15)
+
+#Nice plot
+
+# Extract variable importance
+imp <- var_imp$importance
+imp$Variable <- rownames(imp)
+
+# Keep top 20
+imp <- imp[order(imp$Overall, decreasing = TRUE), ]
+imp <- head(imp, 20)
+
+ggplot(imp, aes(x = reorder(Variable, Overall),
+                y = Overall)) +
+  geom_col(fill = "#5DADE2") +
+  scale_fill_gradientn(
+    colours = theme_colors,
+    guide = "none"
+  ) +
+  coord_flip() +
+  labs(
+    x = "Variable",
+    y = "Importance",
+    title = "GBM: Variable Importance"
+  ) +
+  theme_report
+```
+
+# Model comparison
+
+The table and chart compare the baseline decision tree with the tuned
+random forest and tuned gradient boosting model on the same test
+observations. MSE is mean squared error; RMSE is its square root. Lower
+values indicate smaller prediction errors.
+
+```{r model-comparison-table}
+all_comparison <- data.frame(
+  Method = c("Single Tree", "Random Forest", "GBM"),
+  MSE = c(
+    mean((lcfs_test$total_personal_expenditure - tpe_tree_predictions)^2),
+    mean((lcfs_test$total_personal_expenditure - rf_predictions)^2),
+    mean((lcfs_test$total_personal_expenditure - gbm_test_pred_optim)^2)
+  )
+)
+all_comparison$RMSE <- sqrt(all_comparison$MSE)
+knitr::kable(all_comparison, digits = 3, caption = "Test-set model comparison")
+```
+
+Plot it
+
+```{r model-comparison-plot}
+ggplot(all_comparison, aes(x = Method, y = MSE, fill = MSE)) +
+  geom_col() +
+  labs(title = "Model Comparison: Total Personal Expenditure",
+       x = "Model", y = "Test Mean Squared Error") +
+  scale_fill_gradientn(colours = theme_colors, guide = "none") +
+  theme_report
+```
+
+# Logistic Regression
+
+Logistic Regression model to predict Lowest-Income Households. Uses the
+same data frame To skip tree model chunks, Please execute up to line 223
+if needed.
+
+## Data and binary outcome
+
+Plot Income (Using equalized income)
+
+```{r plt-icome}
+#Plot a variable
+# Basic histogram
+# Calculate income quintile cut-points
+income_quintiles <- quantile(
+  lcfs_data$eqincdoupdated_eqincdo_updated,
+  probs = c(0.2, 0.4, 0.6, 0.8),
+  na.rm = TRUE
+)
+
+basic_histogram <- the_base +
+  geom_histogram(
+    aes(fill = after_stat(x)),
+    bins = 20,
+    colour = "#0F172A",
+    linewidth = 0.4
+  ) +
+  
+  # Quintile boundaries
+  geom_vline(
+    xintercept = income_quintiles,
+    linetype = "dashed",
+    linewidth = 0.8,
+    colour = "red"
+  ) +
+  
+  scale_fill_gradientn(
+    colours = theme_colors,
+    guide = "none"
+  ) +
+  labs(
+    title = "Distribution of Income",
+    subtitle = "Dashed lines represent income quintile boundaries",
+    x = "Equivalised disposable income",
+    y = "Count"
+  ) +
+  theme_report
+
+basic_histogram
+```
+
+The outcome is `1` for a household whose equivalised disposable income
+is at or below the 20th percentile, and `0` otherwise.
+
+```{r data-and-outcome}
+# Filter
+lcfs_data <- lcfs_data[
+  is.finite(lcfs_data$eqincdoupdated_eqincdo_updated),
+]
+
+income_cutoff <- unname(quantile(
+  lcfs_data$eqincdoupdated_eqincdo_updated,
+  probs = 0.20 # Change this to adjust the percentile
+))
+
+lcfs_data$lowest_income_group <- as.integer(
+  lcfs_data$eqincdoupdated_eqincdo_updated <= income_cutoff
+)
+
+cat("Lowest-income cutoff:", round(income_cutoff, 2), "\n")
+outcome_counts <- table(factor(lcfs_data$lowest_income_group, levels = c(0, 1)))
+
+knitr::kable(data.frame(
+  Outcome = c(0, 1),
+  Meaning = c("Not in the lowest income quintile", "In the lowest income quintile"),
+  Households = as.integer(outcome_counts),
+  Percent = round(100 * as.numeric(prop.table(outcome_counts)), 2)
+))
+```
+
+## Estimate with Selected variables
+
+Income variables are excluded from the predictors because income defines
+the outcome.
+
+```{r logistic-regression}
+lcfs_data$economic_position_of_hrp <- factor(lcfs_data$economic_position_of_hrp)
+lcfs_data$government_office_region <- factor(lcfs_data$government_office_region)
+lcfs_data$urban_rural_indicator <- factor(lcfs_data$urban_rural_indicator)
+
+model_variables <- c(
+  "lowest_income_group", "household_size", "number_of_children_g019",
+  "number_of_workers_in_household_a054", "economic_position_of_hrp",
+  "government_office_region", "urban_rural_indicator"
+)
+
+# Define the income cutoff before excluding missing predictor values.
+model_data <- droplevels(lcfs_data[
+  complete.cases(lcfs_data[, model_variables]),
+])
+cat("Households used in the model:", nrow(model_data), "\n")
+cat("Households excluded for missing predictors:",
+    nrow(lcfs_data) - nrow(model_data), "\n")
+
+income_model <- glm(
+  lowest_income_group ~ household_size + number_of_children_g019 +
+    number_of_workers_in_household_a054 + economic_position_of_hrp +
+    government_office_region + urban_rural_indicator,
+  family = binomial(link = "logit"),
+  data = model_data
+)
+summary(income_model)
+```
+
+## Odds ratios
+
+Exponentiation the coefficients gives odds ratios. An odds ratio above 1
+indicates higher odds of belonging to the lowest-income group, for
+categorical predictors, it is relative to the reference category.
+
+```{r odds-ratios}
+cat("Employment reference:", levels(model_data$economic_position_of_hrp)[1], "\n")
+cat("Region reference:", levels(model_data$government_office_region)[1], "\n")
+
+odds_ratios <- exp(cbind(
+  Odds_ratio = coef(income_model),
+  confint.default(income_model)
+))
+knitr::kable(odds_ratios, digits = 3)
+```
+
+## Estimated household probabilities
+
+returns the estimated probability of outcome `1`, between 0 and 1.
+
+```{r predicted-probabilities}
+household_predictions <- data.frame(
+  lowest_income_group = model_data$lowest_income_group,
+  probability_lowest_income = predict(
+    income_model, newdata = model_data, type = "response"
+  )
+)
+
+knitr::kable(head(household_predictions, 10), digits = 3, row.names = FALSE)
+```
+
+## Low-income probability by region
+
+Each bar is the average fitted probability for households in that
+region, using the full logistic regression model. Households retain
+their own characteristics, so the regional differences reflect both
+household composition and region; they do not isolate the effect of
+region alone.
+
+```{r probability-by-region, fig.width=8, fig.height=6}
+region_predictions <- data.frame(
+  government_office_region = model_data$government_office_region,
+  probability_lowest_income = predict(
+    income_model, newdata = model_data, type = "response"
+  )
+)
+
+region_probabilities <- aggregate(
+  probability_lowest_income ~ government_office_region,
+  data = region_predictions,
+  FUN = mean
+)
+#Use excel for this
+region_probability_plot <- ggplot(
+  region_probabilities,
+  aes(
+    x = probability_lowest_income,
+    y = reorder(government_office_region, probability_lowest_income)
+  )
+) +
+  geom_col(fill = "#2E5E7E", width = 0.7) +
+  geom_text(
+    aes(label = scales::percent(probability_lowest_income, accuracy = 0.1)),
+    hjust = -0.15, size = 3.5
+  ) +
+  scale_x_continuous(
+    labels = scales::label_percent(accuracy = 1),
+    limits = c(0, NA),
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "Predicted Low-income Probability by Region",
+    subtitle = "Average fitted probability across households in each region",
+    x = "Probability of belonging to the lowest-income 20%",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank())
+
+region_probability_plot
+```
+
+## ROC curve and AUC
+
+For performance assessment, fit the same model on 70% of households and
+evaluate it on the remaining 30%. Splitting within each outcome group
+keeps similar proportions of low-income households in both sets.
+
+```{r roc-test-predictions}
+set.seed(123)
+roc_train_rows <- unlist(lapply(
+  split(seq_len(nrow(model_data)), model_data$lowest_income_group),
+  function(rows) sample(rows, size = floor(0.70 * length(rows)))
+), use.names = FALSE)
+
+roc_train <- model_data[roc_train_rows, ]
+roc_test <- model_data[-roc_train_rows, ]
+
+roc_income_model <- glm(
+  formula(income_model),
+  family = binomial(link = "logit"),
+  data = roc_train
+)
+
+roc_test$probability_lowest_income <- predict(
+  roc_income_model, newdata = roc_test, type = "response"
+)
+```
+
+Sensitivity is the proportion of low-income households correctly
+identified. Specificity is the proportion of other households correctly
+identified. The ROC curve shows their trade-off across probability
+thresholds.
+
+```{r roc-curve, fig.width=6, fig.height=6}
+lcfs_glm_roc <- pROC::roc(
+  response = roc_test$lowest_income_group,
+  predictor = roc_test$probability_lowest_income,
+  levels = c(0, 1),
+  direction = "<", # Higher probabilities indicate the low-income group.
+  quiet = TRUE
+)
+
+roc_auc <- as.numeric(pROC::auc(lcfs_glm_roc))
+roc_auc_ci <- as.numeric(pROC::ci.auc(lcfs_glm_roc, method = "delong"))
+
+knitr::kable(data.frame(
+  Training_households = nrow(roc_train),
+  Test_households = nrow(roc_test),
+  AUC = roc_auc,
+  Lower_95_CI = roc_auc_ci[1],
+  Upper_95_CI = roc_auc_ci[3]
+), digits = 3)
+
+# ggroc's default horizontal axis is specificity, decreasing from 1 to 0.
+pROC::ggroc(lcfs_glm_roc) +
+  coord_equal() +
+  annotate("segment", x = 1, xend = 0, y = 0, yend = 1,
+           linetype = "dashed", colour = "grey50") +
+  annotate("label", x = 0.90, y = 0.90, label = "Perfect") +
+  annotate("label", x = 0.50, y = 0.50, label = "Chance") +
+  annotate("label", x = 0.98, y = 0.10,
+           label = "Always predict\nnot low-income", hjust = 0, size = 3.5) +
+  annotate("label", x = 0.02, y = 0.90,
+           label = "Always predict\nlow-income", hjust = 1, size = 3.5) +
+  labs(
+    title = "LCFS Logistic Regression: Test-set ROC",
+    subtitle = paste("AUC =", round(roc_auc, 3)),
+    x = "Specificity", y = "Sensitivity"
+  ) +
+  theme_minimal() #custom theme won't work here
+```
+
+## Confusion Matrix
+
+```{r conf-mat}
+threshold <- 0.5
+
+actual <- factor(roc_test$lowest_income_group, levels = c(0, 1))
+
+predicted <- factor(
+  as.integer(roc_test$probability_lowest_income >= threshold),
+  levels = c(0, 1)
+)
+
+# Confusion matrix and performance metrics for all test 
+classification_results <- caret::confusionMatrix(
+  data = predicted,
+  reference = actual,
+  positive = "1"
+)
+
+classification_results
+```
+
+# K nearest neighbour
+
+This will predict the **socio-economic group of the household reference
+person** using eq household income and food expenditure.
+
+## Prepare and load the data
+
+`socio_economic_group_new`. has been created by grouping 40 original
+groups
+
+```{r prep-data}
+# Recover the original codes from the existing labelled source variable.
+seg_code_lookup <- attr(lcfs_2024$a091, "labels")
+names(seg_code_lookup) <- trimws(names(seg_code_lookup))
+
+seg_labels <- trimws(as.character(lcfs_data$socio_economic_group))
+
+lcfs_data <- dplyr::mutate(
+    lcfs_data,
+    socio_economic_group_num = unname(seg_code_lookup[seg_labels]),
+
+    socio_economic_group_new = dplyr::case_when(
+      socio_economic_group_num >= 1  & socio_economic_group_num <= 12 ~ "Managerial & Professional",
+      socio_economic_group_num >= 13 & socio_economic_group_num <= 16 ~ "Intermediate Occupations",
+      socio_economic_group_num >= 17 & socio_economic_group_num <= 20 ~ "Small Employers & Self-employed",
+      socio_economic_group_num >= 21 & socio_economic_group_num <= 23 ~ "Lower Supervisory & Technical",
+      socio_economic_group_num >= 24 & socio_economic_group_num <= 35 ~ "Semi-routine & Routine",
+      TRUE ~ NA_character_
+    ),
+
+    socio_economic_group_new = factor(
+      socio_economic_group_new,
+      levels = c(
+        "Managerial & Professional",
+        "Intermediate Occupations",
+        "Small Employers & Self-employed",
+        "Lower Supervisory & Technical",
+        "Semi-routine & Routine"
+      )
+    ),
+    socio_economic_group_num = NULL
+  )
+
+table(lcfs_data$socio_economic_group_new, useNA = "ifany")
+```
+
+```{r load-data}
+lcfs <- data.frame(
+  socio_economic_group = lcfs_data$socio_economic_group_new,
+  income = lcfs_data$eqincdoupdated_eqincdo_updated,
+  food = lcfs_data$food_adults
+)
+predictors <- c("income", "food")
+stopifnot(all(vapply(lcfs[, predictors], is.numeric, logical(1))))
+
+head(lcfs)
+summary(lcfs)
+```
+
+KNN needs complete numeric predictors and known training labels. exclude
+responses outside the five groups.Therefore, Unused factor levels are
+dropped before modelling.
+
+```{r complete-observations}
+usable <- !is.na(lcfs$socio_economic_group) &
+  nzchar(as.character(lcfs$socio_economic_group)) &
+  is.finite(lcfs$income) & is.finite(lcfs$food)
+
+cat("Households supplied:", nrow(lcfs), "\n")
+cat("Households excluded:", sum(!usable), "\n")
+lcfs <- droplevels(lcfs[usable, ])
+cat("Households retained:", nrow(lcfs), "\n")
+```
+
+## Make training and test sets
+
+Randomly assign about two-thirds of the households **within each group**
+to training and the rest to testing. This split keeps every group
+represented in both sets.
+
+```{r split-data}
+set.seed(123)
+if (nlevels(lcfs$socio_economic_group) < 2 ||
+    any(table(lcfs$socio_economic_group) < 2)) {
+  stop("Need at least two groups and two complete households per group.")
+}
+training_rows <- unlist(lapply(
+  split(seq_len(nrow(lcfs)), lcfs$socio_economic_group),
+  function(rows) sample(rows, size = floor(length(rows) * 2 / 3))
+), use.names = FALSE)
+lcfs_training <- lcfs[training_rows, ]
+lcfs_test <- lcfs[-training_rows, ]
+
+c(Training = nrow(lcfs_training), Test = nrow(lcfs_test))
+```
+
+```{r group-counts}
+group_key <- data.frame(
+  Code = sprintf("G%02d", seq_along(levels(lcfs$socio_economic_group))),
+  Socio_economic_group = levels(lcfs$socio_economic_group),
+  Training = as.integer(table(lcfs_training$socio_economic_group)),
+  Test = as.integer(table(lcfs_test$socio_economic_group))
+)
+knitr::kable(group_key, row.names = FALSE)
+```
+
+## Plot the training data
+
+```{r plot-training-data, fig.width=10, fig.height=13}
+ggplot(lcfs_training, aes(x = income, y = food)) +
+  geom_point(alpha = 0.35, colour = "blue", size = 0.8) +
+  facet_wrap(~ socio_economic_group, ncol = 3, labeller = label_wrap_gen(width = 28)) +
+  labs(x = "Anonymised household income (GBP)",
+       y = "Weekly food spending recorded by adults (GBP)",
+       title = "LCFS training households by socio-economic group") +
+  theme_report
+```
+
+## Scale the predictors
+
+KNN measures how far apart households are. Income has a much wider
+numerical range so standardise
+
+```{r scale-predictors}
+training_x <- scale(lcfs_training[, predictors])
+training_means <- attr(training_x, "scaled:center")
+training_sds <- attr(training_x, "scaled:scale")
+stopifnot(all(is.finite(training_sds)), all(training_sds > 0))
+
+test_x <- scale(lcfs_test[, predictors],
+                center = training_means, scale = training_sds)
+
+knitr::kable(data.frame(
+  Predictor = predictors,
+  Training_mean = as.numeric(training_means),
+  Training_SD = as.numeric(training_sds)
+), digits = 2)
+```
+
+## Finding nearest-neighbour
+
+```{r inspect-neighbours}
+k <- 31
+example_row <- which.max(lcfs_test$income)
+distances <- sqrt(
+  (training_x[, "income"] - test_x[example_row, "income"])^2 +
+  (training_x[, "food"] - test_x[example_row, "food"])^2
+)
+
+# Include all equally distant households at the kth distance,
+# matching class::knn(..., use.all = TRUE).
+distance_cutoff <- sort(distances)[k]
+neighbour_rows <- which(distances <= distance_cutoff)
+neighbour_rows <- neighbour_rows[order(distances[neighbour_rows])]
+
+knitr::kable(lcfs_test[example_row,
+                      c("income", "food")],
+             row.names = FALSE, caption = "Household to classify")
+
+neighbours <- lcfs_training[neighbour_rows,
+                            c("income", "food", "socio_economic_group")]
+neighbours$distance <- distances[neighbour_rows]
+knitr::kable(neighbours, digits = 3, row.names = FALSE,
+             caption = "Nearest training households")
+table(droplevels(neighbours$socio_economic_group))
+```
+
+Plot to illustrate KNN visualization
+
+```{r plot-neighbours, fig.width=9, fig.height=7}
+plot_training <- data.frame(training_x,
+                            group_code = factor(group_key$Code[match(
+                              lcfs_training$socio_economic_group,
+                              group_key$Socio_economic_group
+                            )], levels = group_key$Code))
+plot_example <- as.data.frame(test_x[example_row, , drop = FALSE])
+zoom_radius <- max(0.05, distance_cutoff * 1.5)
+
+ggplot(plot_training, aes(x = income, y = food)) +
+  geom_point(aes(colour = group_code), alpha = 0.35) +
+  geom_segment(
+    data = plot_training[neighbour_rows, ],
+    aes(xend = plot_example$income, yend = plot_example$food),
+    linewidth = 0.7, colour = "black"
+  ) +
+  geom_point(data = plot_training[neighbour_rows, ],
+             shape = 1, size = 4, colour = "black") +
+  geom_point(data = plot_training[neighbour_rows, ],
+             aes(colour = group_code), size = 2) +
+  geom_point(data = plot_example, shape = 8, size = 4, colour = "black") +
+  scale_colour_viridis_d(end = 0.8) +
+  coord_equal(
+    xlim = plot_example$income + c(-zoom_radius, zoom_radius),
+    ylim = plot_example$food + c(-zoom_radius, zoom_radius)
+  ) +
+  labs(x = "Income (Scaled)", y = "Food expenditure (Scaled)",
+       colour = "Socio-economic group", title = "Finding similar households",
+       subtitle = "Star: test household; circles and lines: nearest training households") +
+  guides(colour = guide_legend(ncol = 6, override.aes = list(alpha = 1))) +
+  theme_report +
+  theme(legend.position = "bottom")
+```
+
+## Predict socio-economic group with KNN
+
+Only `income` and `food` enter the distance calculation.
+
+```{r knn-predictions}
+set.seed(123)
+knn_predictions <- class::knn(
+  train = training_x,
+  test = test_x,
+  cl = lcfs_training$socio_economic_group,
+  k = k,
+  use.all = TRUE
+)
+
+prediction_examples <- data.frame(
+  Actual = lcfs_test$socio_economic_group,
+  Predicted = knn_predictions
+)
+knitr::kable(prediction_examples[example_row, ], row.names = FALSE,
+             caption = "Prediction for the illustrated household")
+knitr::kable(head(prediction_examples, 10), row.names = FALSE,
+             caption = "First ten test predictions")
+```
+
+## Confusion matrix
+
+```{r confusion-matrix}
+confusion <- table(Actual = lcfs_test$socio_economic_group,
+                   Predicted = knn_predictions)
+confusion_display <- confusion
+dimnames(confusion_display) <- list(Actual = group_key$Code,
+                                   Predicted = group_key$Code)
+knitr::kable(confusion_display)
+```
+
+Accuracy is the proportion of all test households whose group is
+classified correctly.
+
+```{r performance}
+majority_group <- names(which.max(table(lcfs_training$socio_economic_group)))
+accuracy <- mean(knn_predictions == lcfs_test$socio_economic_group)
+baseline_accuracy <- mean(lcfs_test$socio_economic_group == majority_group)
+group_recall <- diag(confusion) / rowSums(confusion)
+
+cat("Baseline always predicts:", majority_group, "\n")
+knitr::kable(data.frame(
+  Measure = c("KNN accuracy", "Most-common-group baseline accuracy",
+              "Mean recall across groups"),
+  Percent = round(100 * c(accuracy, baseline_accuracy,
+                         mean(group_recall)), 1)
+), row.names = FALSE)
+
+knitr::kable(data.frame(
+  Socio_economic_group = rownames(confusion),
+  Test_households = as.integer(rowSums(confusion)),
+  Correct = as.integer(diag(confusion)),
+  Recall_percent = round(100 * group_recall, 1)
+), row.names = FALSE)
+```
+
+## Hyperparameter Tuning (K)
+
+This gives us K = 17
+
+```{r tune-k}
+# 10-fold cross validation, repeated 10 times. 
+knn.caret <- train(socio_economic_group~ income + food, 
+                   data=lcfs, method="knn", 
+                   trControl=trainControl(method="repeatedcv", 
+                   number=10, repeats = 5), tuneGrid = expand.grid(k = seq(1,31,2)))
+
+knn.caret
+
+results <- data.frame(knn.caret[4])
+
+head(results)
+
+ggplot(results, aes(x=results.k, y=results.Accuracy)) + 
+  geom_line() + labs(x="k", y="Accuracy") +
+  theme_report
+```
+
+## Predict a group for new households
+
+Replace the example income and food amounts below with new household
+values measured in the same way as the training data. Reuse the training
+means and standard deviations, the same predictor order, and the same
+$k$. These predictions are illustrative and should be read alongside the
+held-out performance above.
+
+```{r predict-new-households}
+new_households <- data.frame(
+  income = c(600, 1200),
+  food = c(60, 120)
+)
+new_x <- scale(new_households[, predictors],
+               center = training_means, scale = training_sds)
+set.seed(123)
+new_households$predicted_socio_economic_group <- class::knn(
+  train = training_x,
+  test = new_x,
+  cl = lcfs_training$socio_economic_group,
+  k = k,
+  use.all = TRUE
+)
+knitr::kable(new_households, row.names = FALSE)
+```
